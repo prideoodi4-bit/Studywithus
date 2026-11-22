@@ -34,7 +34,9 @@ def api(method, **args):
 
 
 def clock(stamp):
-    return datetime.fromtimestamp(stamp, IRAQ).strftime("%H:%M")
+    local = datetime.fromtimestamp(stamp, IRAQ)
+    period = "ص" if local.hour < 12 else "م"
+    return f"{local.hour % 12 or 12}:{local.minute:02d} {period}"
 
 
 def finished_sticker(chat):
@@ -71,6 +73,10 @@ def next_hours(now):
 
 def custom_time(text, now):
     value = text.strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
+    match = re.fullmatch(r"(1[0-2]|0?[1-9])(?::([0-5][0-9]))?\s*(صباحاً|مساءً|صباحا|مساءا|مساء|صباح|ص|م)", value)
+    if match:
+        hour, minute, period = match.groups()
+        value = f"{int(hour)%12 + (12 if period.startswith('م') else 0):02d}:{minute or '00'}"
     if re.fullmatch(r"[0-9]{1,5}(?:\s*(?:دقيقة|دقائق|د))?", value):
         minutes = int(re.match(r"[0-9]+", value)[0])
         if 60 <= minutes <= 1440:
@@ -88,10 +94,13 @@ def custom_time(text, now):
 def start_session(db, cid, user, topic, now, end, partner=0):
     uid = user["id"]
     name = " ".join(user["first_name"].split())[:30]
+    root_start = now
+    if partner:
+        root_start = db.execute("SELECT start FROM sessions WHERE chat=? AND uid=?", (cid,partner)).fetchone()[0]
     with db:
         db.execute("BEGIN")
-        db.execute("""INSERT OR REPLACE INTO sessions(chat,uid,name,start,finish,topic,partner)
-            VALUES(?,?,?,?,?,?,?)""", (cid, uid, name, now, end, topic, partner))
+        db.execute("""INSERT OR REPLACE INTO sessions(chat,uid,name,start,finish,topic,partner,group_start)
+            VALUES(?,?,?,?,?,?,?,?)""", (cid, uid, name, now, end, topic, partner, root_start))
         db.execute("DELETE FROM drafts WHERE chat=? AND uid=?", (cid, uid))
         db.execute("UPDATE boards SET dirty=1 WHERE chat=?", (cid,))
     say(cid, f"🟢 <b>بدا السشن</b>\n{tag(uid,name)} · {escape(topic)}\nتخلّص الساعة <b>{clock(end)}</b> بتوقيت بغداد.")
@@ -120,7 +129,7 @@ def session_menu(db, cid, user, now):
                        (cid,now)).fetchall()
     for peer,name,start in peers:
         choices.append([button(f"🤝 أنضم ويا {name}", f"join:{peer}:{start}")])
-    sent = say(cid, f"📚 {tag(uid,user['first_name'])}، شكد تريد تدرس؟\nاختار مدة أو ساعة نهاية بتوقيت بغداد."
+    sent = say(cid, f"📚 {tag(uid,user['first_name'])}، شكد تريد تدرس؟\n🔕 قبل ما تبدي: إذا سولفت بالكروب، أول رسالة تنحذف ويجيك تحذير. إذا كررتها، تنكتم لحد نهاية سشنك. للمشرف تذكير بالكلام فقط.\n\nاختار مدة أو ساعة نهاية بتوقيت بغداد."
                + ("\nبالانضمام تدرس نفس الموضوع، وسشنك ساعة على الأقل." if peers else ""),
                reply_markup={"inline_keyboard": choices})
     db.execute("INSERT OR REPLACE INTO drafts(chat,uid,prompt,minutes,stage) VALUES(?,?,?,0,'menu')",
@@ -142,11 +151,14 @@ def setup_db(path):
     """)
     if "topic" not in {row[1] for row in db.execute("PRAGMA table_info(sessions)")}:
         db.execute("ALTER TABLE sessions ADD COLUMN topic TEXT DEFAULT 'دراسة'")
-    for table, col, definition in (("sessions","partner","INTEGER DEFAULT 0"),
+    for table, col, definition in (("sessions","group_start","INTEGER DEFAULT 0"),("sessions","partner","INTEGER DEFAULT 0"),
                                    ("drafts","deadline","INTEGER DEFAULT 0"),
                                    ("drafts","stage","TEXT DEFAULT 'menu'")):
         if col not in {row[1] for row in db.execute(f"PRAGMA table_info({table})")}:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
+    db.execute("""UPDATE sessions AS s SET group_start=CASE WHEN partner=0 THEN start ELSE
+        COALESCE((SELECT h.start FROM sessions h WHERE h.chat=s.chat AND h.uid=s.partner AND h.start<=s.start),-1)
+        END WHERE group_start=0""")
     db.execute("UPDATE drafts SET stage='topic' WHERE minutes>0 AND stage='menu'")
     db.execute("UPDATE boards SET dirty=1")
     return db
@@ -171,18 +183,30 @@ def tick(db):
             continue
         db.execute("UPDATE reviews SET prompt=? WHERE id=?", (sent["message_id"], rid))
     for chat, msg in db.execute("SELECT chat,msg FROM boards WHERE dirty=1").fetchall():
-        rows = db.execute("""SELECT s.uid,s.name,s.finish,s.topic,p.uid,p.name FROM sessions s
-            LEFT JOIN sessions p ON p.chat=s.chat AND p.uid=s.partner
-            WHERE s.chat=? ORDER BY s.finish,s.name""", (chat,)).fetchall()
-        lines = ["📚 <b>ادرس ويانا | لوحة السشنات</b>", f"🟢 يدرسون هسه: <b>{len(rows)}</b>   ·   توقيت بغداد", ""]
-        for uid,name,end,topic,peer,pname in rows[:15]:
-            partner = f" · ويا {tag(peer,pname)}" if peer else ""
-            lines.append(f"{tag(uid,name)}{partner} · <b>{clock(end)}</b>\n   📖 {escape(topic[:42])}")
-        if len(rows)>15:
-            lines.append(f"وياهم {len(rows)-15} طالب إضافي")
+        rows = db.execute("""SELECT uid,name,finish,topic,partner,group_start FROM sessions
+            WHERE chat=? ORDER BY finish,uid""",(chat,)).fetchall()
+        groups = {}
+        for uid,name,end,topic,partner,start in rows:
+            groups.setdefault((partner or uid,start),[]).append((name,uid,end,topic))
+        lines = ["📚 <b>ادرس ويانا</b>", f"هسه يدرسون {len(rows)} · بتوقيت بغداد"]
+        shown = 0
+        for shared,title in ((True,"🤝 يدرسون سوه"),(False,"📖 يدرسون وحدهم")):
+            section = []
+            for members in groups.values():
+                if (len(members)>1) != shared or shown>=15:
+                    continue
+                topic = escape(members[0][3][:44])
+                section.append(f"\u200f📚 <b>\u2068{topic}\u2069</b>")
+                for name,uid,end,_ in members[:15-shown]:
+                    section.append(f"\u200f• \u2068{tag(uid,name)}\u2069 · لحد {clock(end)}")
+                    shown += 1
+            if section:
+                lines.extend(["",f"<b>{title}</b>",*section])
+        if len(rows)>shown:
+            lines.append(f"وياهم {len(rows)-shown} طالب إضافي")
         if not rows:
-            lines.append("الكروب هادئ. منو يفتح أول سشن؟")
-        lines.append("\nاكتب «انشاء سشن» أو /session حتى تبدي أو تنضم لزميل.\n🔕 أول مخالفة تنبيه، والثانية كتم. للمشرف تذكير بالكلام.")
+            lines.append("منو يبدي أول سشن؟")
+        lines.extend(["","للبداية أو الانضمام اكتب «انشاء سشن»."])
         data = dict(chat_id=chat, text="\n".join(lines), parse_mode="HTML", reply_markup={"inline_keyboard":[]})
         try:
             if msg:
@@ -221,7 +245,7 @@ def handle(db, update, bot):
         draft = db.execute("SELECT prompt,stage FROM drafts WHERE chat=? AND uid=?", (cid,uid)).fetchone()
         if draft == (mid,"menu") and not action.startswith("review:"):
             if action == "custom":
-                ask(db,cid,user,"اكتب المدة بالدقائق (٦٠ إلى ١٤٤٠)، أو وقت النهاية مثل ١٩:٣٠ بنظام ٢٤ ساعة.",stage="custom")
+                ask(db,cid,user,"اكتب المدة بالدقائق (60 إلى 1440)، أو وقت النهاية مثل 7:30 م.",stage="custom")
                 answer = "ردّ على الرسالة بوقتك."
             elif action in ("duration:60","duration:90","duration:120"):
                 ask(db,cid,user,"شنو موضوع السشن؟",minutes=int(action.split(":")[1]))
@@ -278,12 +302,12 @@ def handle(db, update, bot):
             if value:
                 ask(db,cid,user,"شنو موضوع السشن؟",*value)
             else:
-                ask(db,cid,user,"جرّب ٩٠ للدقائق أو ١٩:٣٠ للساعة. أقل مدة ساعة كاملة.", stage="custom")
+                ask(db,cid,user,"جرّب 90 للدقائق أو 7:30 م للساعة. أقل مدة ساعة كاملة.", stage="custom")
             return
         if stage=="topic":
             topic = " ".join(m.get("text","").split())
             if not 1 <= len(topic) <= 100:
-                ask(db,cid,user,"اكتب موضوعك من حرف إلى ١٠٠ حرف.",minutes,end)
+                ask(db,cid,user,"اكتب موضوعك من حرف إلى 100 حرف.",minutes,end)
             elif end and end-now<3600:
                 session_menu(db,cid,user,now)
             else:
